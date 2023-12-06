@@ -4,12 +4,16 @@ const http = require('http');
 const axios = require('axios');
 const express = require('express');
 const { Blockchain, Block } = require('./blockchain');
-const PORT_DISCOVERY = 6001;
+
+const PORT_DISCOVERY = 3000;
+const GATEWAY_SERVER = 'http://localhost:8000'; // URL do servidor do gateway
+
 
 class P2PServer {
-    constructor(blockchain, port=0) {
+    constructor(blockchain, port = 0) {
         this.blockchain = blockchain;
         this.peers = [];
+        this.peerAddress = ''
         const server = http.createServer();
         this.io = new Server(server);
         this.ready = new Promise((resolve, reject) => {
@@ -20,125 +24,115 @@ class P2PServer {
             }).on('error', reject);
         });
     }
-    
 
     listen() {
         this.io.on('connection', socket => {
             console.log('Novo peer conectado');
-            this.peers.push(socket);
+            this.peerAddress = `${socket.handshake.address}:${socket.handshake.port}`;
+            socket.peerAddress = this.peerAddress; // Armazenando o endereço do peer
+            this.peers[this.peerAddress] = socket; // Usando um objeto para mapear o endereço ao socket
             this.handleMessages(socket);
-            this.registerNode(this.port);
-            // Você pode adicionar aqui mais lógica para quando um novo peer se conecta
+
+            socket.on('disconnect', () => {
+                console.log(`Peer desconectado: ${this.peerAddress}`);
+                delete this.peers[this.peerAddress]; // Removendo da lista local
+                this.notifyPeersAboutDisconnect(this.peerAddress); // Notificando outros peers
+                this.unregisterNode(this.peerAddress); // Desregistrar do servidor de descoberta
+            });
         });
     }
 
-
-    
+    notifyPeersAboutDisconnect(disconnectedPeerAddress) {
+        Object.values(this.peers).forEach(peerSocket => {
+            if (peerSocket.peerAddress !== `http://localhost:${this.port}`) {
+                peerSocket.emit('peerDisconnected', { address: disconnectedPeerAddress });
+            }
+        });
+    }
 
     handleMessages(socket) {
         socket.on('newBlock', blockData => {
-            const receivedBlock = new Block(blockData.index, blockData.timestamp, blockData.data, blockData.previousHash);
-            const latestBlock = this.blockchain.getLatestBlock();
 
-            if (receivedBlock.previousHash === latestBlock.hash && receivedBlock.hash === receivedBlock.calculateHash()) {
-                this.blockchain.addBlock(receivedBlock);
-                this.broadcastNewBlock(receivedBlock);
-            } else if (receivedBlock.index > latestBlock.index) {
-                // Lógica para solicitar a cadeia completa ou resolver conflitos
+            this.blockchain.addBlock(blockData);
+            const updatedBlockchain = this.blockchain; // Atualiza a variável com a blockchain atualizada
+
+
+            Object.values(this.peers).forEach(peerSocket => {
+
+                if (peerSocket.peerAddress !== `http://localhost:${this.port}`) {
+                    console.log(`Enviando para ${peerSocket.peerAddress}`);
+                    peerSocket.emit('blockchainUpdated', updatedBlockchain);
+                }
+            });
+        });
+
+        socket.on('blockchainUpdated', newBlockchain => {
+
+            this.blockchain.chain = newBlockchain.chain;
+            this.blockchain.lastIndex = newBlockchain.lastIndex;
+            this.blockchain.votingContract.votacoes = newBlockchain.votingContract.votacoes;
+            
+            console.log(`receptor:${this.blockchain}`)
+
+        });
+
+        socket.on('requestBlockchain', () => {
+            socket.emit('responseBlockchain', this.blockchain);
+        });
+
+        socket.on('responseBlockchain', receivedBlockchain => {
+            if (receivedBlockchain.isChainValid() && receivedBlockchain.chain.length > this.blockchain.chain.length) {
+                this.blockchain = receivedBlockchain;
             }
         });
 
-        socket.on('votingContractState', newState => {
-            console.log(newState);
-            this.blockchain.votingContract.updateState(newState);
+        socket.on('requestVotingContractState', () => {
+            socket.emit('responseVotingContractState', this.blockchain.votingContract.getVotacoes());
         });
 
-        // Outros manipuladores de eventos, como createVote, castVote, etc.
+        socket.on('responseVotingContractState', receivedState => {
+            console.log(receivedState);
+            this.blockchain.votingContract.updateState(receivedState);
+        });
+
+        socket.on('peerDisconnected', () => {
+            delete this.peers[socket.peerAddress]; // Removendo da lista local
+            this.unregisterNode(socket.peerAddress); // Desregistrar do servidor de descoberta
+        });
+    }
+
+
+    async updatePeersList() {
+        try {
+            const response = await axios.get('http://localhost:3000/nodes');
+            const currentPeers = response.data.nodes;
+            console.log(currentPeers)
+            currentPeers.forEach(peerAddress => {
+                const peerPort = peerAddress.split(':').pop(); // Obtém a porta do peer da string do endereço
+                if (peerPort != this.port && !this.peers.some(p => p.peerAddress === peerAddress)) {
+                    console.log(peerAddress);
+                    this.connectToPeer(peerAddress);
+                }
+            });
+        } catch (error) {
+            console.error('Erro ao atualizar a lista de peers:', error);
+        }
     }
 
     connectToPeer(newPeer) {
-        const socket = ioClient(newPeer); // Cria uma conexão de cliente para o novo peer
+        const socket = ioClient(newPeer);
+        socket.peerAddress = newPeer; // Adiciona o endereço do peer ao socket para referência futura
         this.peers.push(socket);
-        this.handleMessages(socket); // Configura os manipuladores de mensagens para o novo peer
+        this.setupPeerEvents(socket);
+    }
+
+    setupPeerEvents(socket) {
+        socket.on('connect', () => {
+            console.log(`Conectado ao peer ${socket.peerAddress}`);
+        });
     }
 
 
-    initHttpServer() {
-        const app = express();
-        app.use(express.json());
-
-        app.post('/createVotacao', (req, res) => {
-            const { votacaoId, titulo, categorias } = req.body;
-            this.blockchain.votingContract.createVotacao(votacaoId, titulo, categorias);
-        
-            // Cria um bloco para registrar a criação da votação
-            const newBlockData = { type: 'createVotacao', votacaoId };
-
-            const newBlock = new Block( 
-                this.blockchain.getLatestBlock().index + 1,
-                Date.now().toString(),
-                [newBlockData],
-                this.blockchain.getLatestBlock().hash
-            );
-
-            this.blockchain.addBlock(newBlock);
-            this.broadcastNewBlock(newBlock);
-            this.broadcastVotingContractState();
-        
-            res.json({ message: 'Votação criada.' });
-        });
-
-        app.post('/vote', (req, res) => {
-            const { votacaoId, categoria } = req.body;
-        
-            const newBlockData = {
-                type: 'vote',
-                details: { votacaoId, categoria }
-            };
-        
-            const newBlock = new Block(
-                this.blockchain.getLatestBlock().index + 1,
-                Date.now().toString(),
-                [newBlockData],
-                this.blockchain.getLatestBlock().hash
-            );
-        
-            this.blockchain.addBlock(newBlock);
-            this.broadcastNewBlock(newBlock); // Propaga o novo bloco para a rede
-        
-            res.json({ message: 'Voto registrado e bloco adicionado à blockchain.' });
-        });
-
-        app.get('/votacoes', (req, res) => {
-            const votacoes = this.blockchain.votingContract.getVotacoes();
-            res.json(votacoes);
-        });
-
-
-        app.get('/getContagemVotos/:votacaoId/:categoria', (req, res) => {
-            const votacaoId = req.params.votacaoId;
-            const categoria = req.params.categoria;
-            const votos = this.blockchain.votingContract.getContagemVotos(votacaoId, categoria);
-            res.json({ votacaoId, categoria, votos });
-        });
-
-        app.get('/getVotacao/:votacaoId', (req, res) => {
-            const votacaoId = req.params.votacaoId;
-            const votacao = this.blockchain.votingContract.getInformacoesVotacao(votacaoId);
-            res.json(votacao);
-        });
-
-
-        // Outros endpoints conforme necessário
-
-        const server = app.listen(0, () => {
-            const port = server.address().port;
-            console.log(`Servidor HTTP ouvindo na porta ${port}`);
-            this.registerNode(port); // Registre este nó no servidor de descoberta
-        });
-    }
-
-    // Método para registrar o nó no servidor de descoberta
     async registerNode(port) {
         try {
             await axios.post('http://localhost:3000/register', {
@@ -150,25 +144,20 @@ class P2PServer {
         }
     }
 
-
-    broadcastNewBlock(block) {
-        this.peers.forEach(peer => {
-            peer.emit('newBlock', block);
-        });
+    async unregisterNode(port) {
+        try {
+            await axios.post('http://localhost:3000/unregister', {
+                address: `http://localhost:${port}`
+            });
+            console.log('Nó desregistrado com sucesso.');
+        } catch (error) {
+            console.error('Erro ao desregistrar o nó:', error);
+        }
     }
-
-    broadcastVotingContractState() {
-        const state = this.blockchain.votingContract.getVotacoes();
-        console.log(state);
-        this.peers.forEach(peer => {
-            peer.emit('votingContractState', state);
-        });
-    }
-
 
     async connectToDiscoveryServer(discoveryServerUrl) {
         try {
-            const response = await axios.post(`${discoveryServerUrl}/register`, { address: `http://localhost:${PORT_DISCOVERY}` });
+            const response = await axios.post(`${discoveryServerUrl}/register`, { address: `http://localhost:${this.port}` });
             const nodes = response.data.nodes;
             nodes.forEach(node => {
                 if (node !== `http://localhost:${PORT_DISCOVERY}`) {
@@ -180,9 +169,20 @@ class P2PServer {
         }
     }
 
+    requestLatestBlockchain() {
+        this.peers.forEach(peer => {
+            peer.emit('requestBlockchain');
+        });
+    }
 
 
-    
+    async start() {
+        await this.ready;
+        this.listen();
+        await this.connectToDiscoveryServer(`http://localhost:${PORT_DISCOVERY}`);
+        this.requestLatestBlockchain();
+        setInterval(() => this.updatePeersList(), 10000); // Atualiza a lista de peers a cada 10 segundos
+    }
 }
 
 module.exports = P2PServer;

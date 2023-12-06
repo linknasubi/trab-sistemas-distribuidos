@@ -16,9 +16,10 @@ class Block {
 }
 
 class Blockchain {
-    constructor() {
+    constructor(votingContract) {
         this.chain = [this.createGenesisBlock()];
         this.votingContract = new VotingContract();
+        this.lastIndex = 0;
     }
 
     createGenesisBlock() {
@@ -29,16 +30,20 @@ class Blockchain {
         return this.chain[this.chain.length - 1];
     }
 
-    addBlock(newBlock) {
-        newBlock.previousHash = this.getLatestBlock().hash;
+    addBlock(newBlockData) {
+        
+        const newIndex = this.generateNextIndex(); // Gere o próximo índice
+        const newTimestamp = this.getCurrentTimestamp(); // Obtenha o timestamp atual
+        const newBlock = new Block(newIndex, newTimestamp, newBlockData, this.getLatestBlock().hash);
         newBlock.hash = newBlock.calculateHash();
         this.chain.push(newBlock);
-    
+
         // Processa as transações/votações do bloco
-        newBlock.data.forEach(transacao => {
-            // Supondo que a transação tenha um votacaoId e uma categoria
-            this.votingContract.registrarVoto(transacao.votacaoId, transacao.categoria);
-        });
+        if (newBlockData.transactionType === "createVotacao") {
+            this.votingContract.createVotacao(newBlockData.votacaoId, newBlockData.titulo, newBlockData.categorias);
+        } else if (newBlockData.transactionType === "registerVote") {
+            this.votingContract.registrarVoto(newBlockData.votacaoId, newBlockData.categoria);
+        }
     }
 
     isChainValid() {
@@ -56,6 +61,19 @@ class Blockchain {
         }
         return true;
     }
+
+
+    generateNextIndex() {
+        // Incremente o último índice usado para obter o próximo índice
+        this.lastIndex++;
+        return this.lastIndex;
+    }
+
+    getCurrentTimestamp() {
+        const currentTimestamp = new Date().getTime();
+        return new Date(currentTimestamp).toLocaleString();
+    }
+
 }
 
 module.exports.Blockchain = Blockchain;
